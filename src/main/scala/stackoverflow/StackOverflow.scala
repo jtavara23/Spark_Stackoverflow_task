@@ -6,6 +6,7 @@ import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
 import annotation.tailrec
 import scala.reflect.ClassTag
+import scala.collection.JavaConversions._
 
 /** A raw stackoverflow posting, either a question or an answer */
 case class Posting(postingType: Int, id: Int, acceptedAnswer: Option[Int], parentId: Option[QID], score: Int, tags: Option[String]) extends Serializable
@@ -27,6 +28,13 @@ object StackOverflow extends StackOverflow {
     val vectors = vectorPostings(scored)
 //    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
 
+    /*
+    lines: the lines from the csv file as strings
+    raw: the raw Posting entries for each line
+    grouped: questions and answers grouped together
+    scored: questions and scores
+    vectors: pairs of (language, score) for each question
+    */
     val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
     val results = clusterResults(means, vectors)
     printResults(results)
@@ -64,6 +72,27 @@ class StackOverflow extends Serializable {
   //
 
   /** Load postings from the given file */
+
+  /**
+       <postTypeId>:     Type of the post. Type 1 = question,
+                      type 2 = answer.
+
+      <id>:             Unique id of the post (regardless of type).
+
+      <acceptedAnswer>: Id of the accepted answer post. This
+                      information is optional, so maybe be missing
+                      indicated by an empty string.
+
+      <parentId>:       For an answer: id of the corresponding
+                      question. For a question:missing, indicated
+                      by an empty string.
+
+      <score>:          The StackOverflow score (based on user
+                      votes).
+
+      <tag>:            The tag indicates the programming language
+                      that the post is about, in case it's a
+                      question, or missing in case it's an answer. */
   def rawPostings(lines: RDD[String]): RDD[Posting] =
     lines.map(line => {
       val arr = line.split(",")
@@ -77,27 +106,44 @@ class StackOverflow extends Serializable {
 
 
   /** Group the questions and answers together */
+  /**
+  * In the raw variable we have simple postings, either questions or answers,
+   * but in order to use the data we need to assemble them together.
+   * Questions are identified using a postTypeId == 1.
+   * Answers to a question with id == QID have (a) postTypeId == 2 and (b) parentId == QID.
+  * */
   def groupedPostings(postings: RDD[Posting]): RDD[(QID, Iterable[(Question, Answer)])] = {
-    ???
+    /*
+    * first filter the questions and answers separately and then
+    * prepare them for a join operation by extracting the QID value in the first element of a tuple.
+    * */
+
+    val questions = postings.filter(_.postingType == 1).map(ques => (ques.id,ques))
+    val answers = for{
+      post  <-  postings.filter(_.postingType ==2)
+      parentId <- post.parentId
+    } yield (parentId,post)
+
+    questions.join(answers).groupByKey()
   }
 
 
   /** Compute the maximum score for each posting */
   def scoredPostings(grouped: RDD[(QID, Iterable[(Question, Answer)])]): RDD[(Question, HighScore)] = {
 
-    def answerHighScore(as: Array[Answer]): HighScore = {
+    def answerHighScore(as: Array[Posting]): Int = {
       var highScore = 0
-          var i = 0
-          while (i < as.length) {
-            val score = as(i).score
-                if (score > highScore)
-                  highScore = score
-                  i += 1
-          }
+      var i = 0
+      while (i < as.length) {
+        val score = as(i).score
+        if (score > highScore)
+          highScore = score
+        i += 1
+      }
       highScore
     }
 
-    ???
+    grouped.map(gg => (gg._2.head._1, answerHighScore(gg._2.map(_._2).toArray)))
   }
 
 
@@ -117,7 +163,10 @@ class StackOverflow extends Serializable {
       }
     }
 
-    ???
+    val result = scored.map(score => (firstLangInTag(score._1.tags, langs).getOrElse(0) * langSpread, score._2))
+    result.cache()
+    result
+
   }
 
 
@@ -172,9 +221,14 @@ class StackOverflow extends Serializable {
 
   /** Main kmeans computation */
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
-    val newMeans = means.clone() // you need to compute newMeans
+    //val newMeans = means.clone() // you need to compute newMeans
 
     // TODO: Fill in the newMeans array
+
+    val closestGrouped = vectors.map( vector => (findClosest(vector,means), vector)).groupByKey()
+    val updatedMeans = closestGrouped.mapValues(averageVectors).collect().toMap
+    val newMeans = means.indices.map(ind => updatedMeans.getOrElse(ind, means(ind))).toArray
+
     val distance = euclideanDistance(means, newMeans)
 
     if (debug) {
@@ -275,10 +329,27 @@ class StackOverflow extends Serializable {
     val closestGrouped = closest.groupByKey()
 
     val median = closestGrouped.mapValues { vs =>
-      val langLabel: String   = ??? // most common language in the cluster
-      val langPercent: Double = ??? // percent of the questions in the most common language
-      val clusterSize: Int    = ???
-      val medianScore: Int    = ???
+      val grouped: Map[Int, Int] = vs
+        .map(_._1 / langSpread) // gt original index dividing by the langSpread
+        .groupBy(identity) // group by the index
+        .mapValues(_.size) // get sizes
+
+      val mostComLangIndex = grouped.maxBy(_._2)._1 //((LangIndex *langSpread), score)
+
+      val langLabel: String   = langs(mostComLangIndex) // most common language in the cluster
+      //val langPercent: Double = (mostComLang._2 / vs.size) *100.0 // percent of the questions in the most common language
+      val clusterSize: Int    = vs.size
+      val langPercent: Double = grouped(mostComLangIndex) * 100.0d / vs.size // percent of the questions in the most common language
+
+      val sortedScores = vs.map(_._2).toList.sorted
+      val mitad = clusterSize/2
+      val medianScore: Int   = {
+        if(clusterSize %2 == 0)
+          (sortedScores(mitad -1) + sortedScores(mitad))/2
+        else
+          sortedScores(mitad)
+
+      }
 
       (langLabel, langPercent, clusterSize, medianScore)
     }
